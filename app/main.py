@@ -383,9 +383,9 @@ def debug_load_model():
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     return templates.TemplateResponse(
+        request=request,
         name="index.html",
         context={
-            "request": request,
             "model_uri": get_effective_model_uri(),
             "threshold": THRESHOLD,
         },
