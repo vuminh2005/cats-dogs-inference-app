@@ -65,6 +65,14 @@ model_load_lock = threading.Lock()
 engine = None
 s3_client = None
 last_model_file_debug = None
+model_load_status = {
+    "status": "not_started",
+    "step": None,
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_seconds": None,
+    "error": None,
+}
 
 
 # ============================================================================
@@ -103,6 +111,36 @@ def startup_event():
 # UTILS
 # ============================================================================
 
+def update_model_load_status(**kwargs):
+    """Update simple JSON-serializable model loading status for debugging."""
+    global model_load_status
+    model_load_status.update(kwargs)
+
+
+def current_model_load_status() -> dict:
+    status = dict(model_load_status)
+    if status.get("started_at") and not status.get("finished_at"):
+        status["elapsed_seconds"] = round(time.time() - status["started_at"], 2)
+    return status
+
+
+def head_model_object() -> dict:
+    if not MODEL_R2_OBJECT_KEY:
+        raise RuntimeError("MODEL_R2_OBJECT_KEY is not set")
+    if s3_client is None:
+        raise RuntimeError("S3 client is not initialized")
+
+    resp = s3_client.head_object(Bucket=R2_BUCKET_NAME, Key=MODEL_R2_OBJECT_KEY)
+    return {
+        "bucket": R2_BUCKET_NAME,
+        "key": MODEL_R2_OBJECT_KEY,
+        "content_length_bytes": int(resp.get("ContentLength", 0)),
+        "content_length_mb": round(int(resp.get("ContentLength", 0)) / (1024 * 1024), 2),
+        "content_type": resp.get("ContentType"),
+        "etag": resp.get("ETag"),
+        "last_modified": resp.get("LastModified").isoformat() if resp.get("LastModified") else None,
+    }
+
 def get_effective_model_uri() -> str:
     if MODEL_R2_OBJECT_KEY:
         return f"s3://{R2_BUCKET_NAME}/{MODEL_R2_OBJECT_KEY}"
@@ -131,7 +169,7 @@ def inspect_model_file(path: str) -> dict:
     }
 
 
-def download_model_from_r2() -> str:
+def download_model_from_r2(force: bool = False) -> str:
     if not MODEL_R2_OBJECT_KEY:
         raise RuntimeError("MODEL_R2_OBJECT_KEY is not set")
     if s3_client is None:
@@ -139,20 +177,29 @@ def download_model_from_r2() -> str:
 
     os.makedirs(os.path.dirname(MODEL_LOCAL_PATH) or "/tmp", exist_ok=True)
 
-    # Always re-download if local file is missing or too small.
-    # A valid model in this project is around hundreds of MB.
-    should_download = True
-    if os.path.exists(MODEL_LOCAL_PATH):
-        current_size = os.path.getsize(MODEL_LOCAL_PATH)
-        should_download = current_size < 1024 * 1024
+    # Reuse only if it already looks like a valid .keras zip file.
+    # This avoids reusing a partially downloaded/corrupted file in /tmp.
+    if not force and os.path.exists(MODEL_LOCAL_PATH):
+        info = inspect_model_file(MODEL_LOCAL_PATH)
+        if info["size_bytes"] > 1024 * 1024 and info["is_zipfile"]:
+            return MODEL_LOCAL_PATH
 
-    if should_download:
-        s3_client.download_file(
-            Bucket=R2_BUCKET_NAME,
-            Key=MODEL_R2_OBJECT_KEY,
-            Filename=MODEL_LOCAL_PATH,
-        )
+    update_model_load_status(step="checking_r2_object")
+    head_model_object()
 
+    tmp_path = MODEL_LOCAL_PATH + ".download"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    update_model_load_status(step="downloading_model_from_r2")
+    s3_client.download_file(
+        Bucket=R2_BUCKET_NAME,
+        Key=MODEL_R2_OBJECT_KEY,
+        Filename=tmp_path,
+    )
+
+    os.replace(tmp_path, MODEL_LOCAL_PATH)
+    update_model_load_status(step="downloaded_model_from_r2")
     return MODEL_LOCAL_PATH
 
 
@@ -171,36 +218,76 @@ def get_model():
     global model, last_model_file_debug
 
     if model is not None:
+        update_model_load_status(status="loaded", step="already_loaded", error=None)
         return model
 
     with model_load_lock:
         if model is not None:
+            update_model_load_status(status="loaded", step="already_loaded", error=None)
             return model
 
-        # Lazy import TensorFlow only when model is really needed.
-        import tensorflow as tf
+        started_at = time.time()
+        update_model_load_status(
+            status="loading",
+            step="starting",
+            started_at=started_at,
+            finished_at=None,
+            elapsed_seconds=None,
+            error=None,
+        )
 
-        if MODEL_R2_OBJECT_KEY:
-            local_model_path = download_model_from_r2()
-        elif MODEL_RUN_ID:
-            local_model_path = download_model_from_mlflow_artifacts()
-        else:
-            # Fallback. Prefer not to use this on Render free tier for large models.
-            import mlflow.tensorflow
-            model = mlflow.tensorflow.load_model(MODEL_URI)
-            return model
+        try:
+            if MODEL_R2_OBJECT_KEY:
+                local_model_path = download_model_from_r2()
+            elif MODEL_RUN_ID:
+                update_model_load_status(step="downloading_model_from_mlflow_artifacts")
+                local_model_path = download_model_from_mlflow_artifacts()
+            else:
+                update_model_load_status(step="loading_with_mlflow_tensorflow")
+                import mlflow.tensorflow
+                model = mlflow.tensorflow.load_model(MODEL_URI)
+                update_model_load_status(
+                    status="loaded",
+                    step="loaded_with_mlflow_tensorflow",
+                    finished_at=time.time(),
+                    elapsed_seconds=round(time.time() - started_at, 2),
+                    error=None,
+                )
+                return model
 
-        last_model_file_debug = inspect_model_file(local_model_path)
-        if not last_model_file_debug["exists"]:
-            raise RuntimeError(f"Downloaded model file does not exist: {last_model_file_debug}")
-        if not last_model_file_debug["is_zipfile"]:
-            raise RuntimeError(
-                "Downloaded .keras file is not a valid zip file. "
-                f"Debug info: {last_model_file_debug}"
+            last_model_file_debug = inspect_model_file(local_model_path)
+            if not last_model_file_debug["exists"]:
+                raise RuntimeError(f"Downloaded model file does not exist: {last_model_file_debug}")
+            if not last_model_file_debug["is_zipfile"]:
+                raise RuntimeError(
+                    "Downloaded .keras file is not a valid zip file. "
+                    f"Debug info: {last_model_file_debug}"
+                )
+
+            update_model_load_status(step="importing_tensorflow")
+            import tensorflow as tf
+
+            update_model_load_status(step="loading_keras_model")
+            model = tf.keras.models.load_model(local_model_path, compile=False)
+
+            update_model_load_status(
+                status="loaded",
+                step="loaded",
+                finished_at=time.time(),
+                elapsed_seconds=round(time.time() - started_at, 2),
+                error=None,
             )
+            return model
 
-        model = tf.keras.models.load_model(local_model_path, compile=False)
-        return model
+        except Exception as exc:
+            update_model_load_status(
+                status="error",
+                step="error",
+                finished_at=time.time(),
+                elapsed_seconds=round(time.time() - started_at, 2),
+                error=str(exc),
+            )
+            raise
 
 
 def preprocess_image(file_bytes: bytes) -> np.ndarray:
@@ -345,6 +432,7 @@ def health():
         "model_r2_object_key": MODEL_R2_OBJECT_KEY,
         "model_local_path": MODEL_LOCAL_PATH,
         "last_model_file_debug": last_model_file_debug,
+        "model_load_status": current_model_load_status(),
         "img_size": IMG_SIZE,
         "threshold": THRESHOLD,
         "uncertain_confidence_threshold": UNCERTAIN_CONFIDENCE_THRESHOLD,
@@ -378,6 +466,90 @@ def debug_load_model():
                 "error": str(exc),
             },
         )
+
+
+
+@app.get("/debug/model-object")
+def debug_model_object():
+    try:
+        return {
+            "status": "ok",
+            "object": head_model_object(),
+            "effective_model_uri": get_effective_model_uri(),
+        }
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": str(exc), "effective_model_uri": get_effective_model_uri()},
+        )
+
+
+@app.get("/debug/download-model-file")
+def debug_download_model_file(force: bool = False):
+    global last_model_file_debug
+    try:
+        local_path = download_model_from_r2(force=force)
+        last_model_file_debug = inspect_model_file(local_path)
+        return {
+            "status": "downloaded",
+            "effective_model_uri": get_effective_model_uri(),
+            "local_path": local_path,
+            "last_model_file_debug": last_model_file_debug,
+        }
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "effective_model_uri": get_effective_model_uri(),
+                "last_model_file_debug": last_model_file_debug,
+                "error": str(exc),
+            },
+        )
+
+
+@app.get("/debug/load-status")
+def debug_load_status():
+    return {
+        "model_loaded": model is not None,
+        "model_load_status": current_model_load_status(),
+        "last_model_file_debug": last_model_file_debug,
+        "effective_model_uri": get_effective_model_uri(),
+    }
+
+
+def _background_model_loader():
+    try:
+        get_model()
+    except Exception:
+        # get_model already records the error in model_load_status.
+        pass
+
+
+@app.get("/debug/start-load-model")
+def debug_start_load_model():
+    if model is not None:
+        return {
+            "status": "already_loaded",
+            "model_load_status": current_model_load_status(),
+            "last_model_file_debug": last_model_file_debug,
+        }
+
+    current_status = current_model_load_status().get("status")
+    if current_status == "loading":
+        return {
+            "status": "already_loading",
+            "model_load_status": current_model_load_status(),
+            "last_model_file_debug": last_model_file_debug,
+        }
+
+    thread = threading.Thread(target=_background_model_loader, daemon=True)
+    thread.start()
+    return {
+        "status": "started",
+        "message": "Model loading started in a background thread. Poll /debug/load-status.",
+        "model_load_status": current_model_load_status(),
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
