@@ -5,15 +5,26 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
+# Giảm bớt log TensorFlow và giới hạn thread để hợp hơn với Render CPU/RAM thấp.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import boto3
 import mlflow
 import mlflow.tensorflow
 import numpy as np
+import tensorflow as tf
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
+from mlflow.tracking import MlflowClient
 from PIL import Image
 from sqlalchemy import create_engine, text
+
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except Exception:
+    pass
 
 # ============================================================================
 # CONFIG
@@ -21,6 +32,16 @@ from sqlalchemy import create_engine, text
 
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI")
 MODEL_URI = os.getenv("MODEL_URI", "models:/cats_dogs_classifier@champion")
+
+# Ưu tiên cách load trực tiếp file .keras artifact từ run.
+# Trên Render thêm:
+# MODEL_RUN_ID=0d81fbc6a8c9455188d422298766dea3
+# KERAS_MODEL_ARTIFACT_PATH=model/data/model.keras
+MODEL_RUN_ID = os.getenv("MODEL_RUN_ID")
+KERAS_MODEL_ARTIFACT_PATH = os.getenv(
+    "KERAS_MODEL_ARTIFACT_PATH",
+    "model/data/model.keras",
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -32,9 +53,7 @@ AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "auto")
 
-IMG_SIZE = tuple(
-    int(x) for x in os.getenv("IMG_SIZE", "299,299").split(",")
-)
+IMG_SIZE = tuple(int(x.strip()) for x in os.getenv("IMG_SIZE", "299,299").split(","))
 NUM_CHANNELS = int(os.getenv("NUM_CHANNELS", "3"))
 THRESHOLD = float(os.getenv("PREDICTION_THRESHOLD", "0.5"))
 
@@ -52,28 +71,35 @@ model = None
 engine = None
 s3_client = None
 
-
 # ============================================================================
 # STARTUP
 # ============================================================================
 
 @app.on_event("startup")
 def startup_event():
-    global model, engine, s3_client
+    """Chỉ khởi tạo DB/R2/MLflow config.
 
-    if not MLFLOW_TRACKING_URI:
-        raise RuntimeError("Missing MLFLOW_TRACKING_URI")
-    if not DATABASE_URL:
-        raise RuntimeError("Missing DATABASE_URL")
-    if not R2_BUCKET_NAME:
-        raise RuntimeError("Missing R2_BUCKET_NAME")
-    if not R2_ENDPOINT_URL:
-        raise RuntimeError("Missing MLFLOW_S3_ENDPOINT_URL")
+    Không load model ở startup, vì Render cần app mở port trước.
+    Model sẽ được lazy-load ở request /predict hoặc /debug/load-model.
+    """
+    global engine, s3_client
+
+    missing_vars = []
+    for name, value in {
+        "MLFLOW_TRACKING_URI": MLFLOW_TRACKING_URI,
+        "DATABASE_URL": DATABASE_URL,
+        "R2_BUCKET_NAME": R2_BUCKET_NAME,
+        "MLFLOW_S3_ENDPOINT_URL": R2_ENDPOINT_URL,
+        "AWS_ACCESS_KEY_ID": AWS_ACCESS_KEY_ID,
+        "AWS_SECRET_ACCESS_KEY": AWS_SECRET_ACCESS_KEY,
+    }.items():
+        if not value:
+            missing_vars.append(name)
+
+    if missing_vars:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-
-    # Load model một lần khi app start, không load lại mỗi request
-    model = mlflow.tensorflow.load_model(MODEL_URI)
 
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -85,10 +111,40 @@ def startup_event():
         region_name=AWS_DEFAULT_REGION,
     )
 
-
 # ============================================================================
 # UTILS
 # ============================================================================
+
+def get_effective_model_uri() -> str:
+    if MODEL_RUN_ID:
+        return f"runs:/{MODEL_RUN_ID}/{KERAS_MODEL_ARTIFACT_PATH}"
+    return MODEL_URI
+
+
+def get_model():
+    """Lazy load model.
+
+    Ưu tiên tải thẳng file .keras artifact từ MLflow run bằng MODEL_RUN_ID.
+    Cách này tránh lỗi mlflow.tensorflow.load_model() không tìm thấy data/model.keras.
+    Nếu không set MODEL_RUN_ID, fallback về MODEL_URI.
+    """
+    global model
+
+    if model is not None:
+        return model
+
+    if MODEL_RUN_ID:
+        client = MlflowClient()
+        local_model_path = client.download_artifacts(
+            run_id=MODEL_RUN_ID,
+            path=KERAS_MODEL_ARTIFACT_PATH,
+        )
+        model = tf.keras.models.load_model(local_model_path)
+        return model
+
+    model = mlflow.tensorflow.load_model(MODEL_URI)
+    return model
+
 
 def preprocess_image(file_bytes: bytes) -> np.ndarray:
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
@@ -114,6 +170,21 @@ def upload_image_to_r2(file_bytes: bytes, filename: str, content_type: str) -> s
     )
 
     return f"s3://{R2_BUCKET_NAME}/{object_key}"
+
+
+def parse_model_name_version(model_uri: str) -> tuple[Optional[str], Optional[str]]:
+    model_name = None
+    model_version = None
+
+    if model_uri.startswith("models:/"):
+        parts = model_uri.replace("models:/", "").split("/")
+        model_name = parts[0] if len(parts) > 0 else None
+        model_version = parts[1] if len(parts) > 1 else None
+    elif model_uri.startswith("runs:/"):
+        model_name = "run_artifact"
+        model_version = MODEL_RUN_ID
+
+    return model_name, model_version
 
 
 def save_prediction_log(
@@ -161,13 +232,7 @@ def save_prediction_log(
         """
     )
 
-    # Parse thô để dễ xem trong DB
-    model_name = None
-    model_version = None
-    if model_uri.startswith("models:/"):
-        parts = model_uri.replace("models:/", "").split("/")
-        model_name = parts[0] if len(parts) > 0 else None
-        model_version = parts[1] if len(parts) > 1 else None
+    model_name, model_version = parse_model_name_version(model_uri)
 
     with engine.begin() as conn:
         conn.execute(
@@ -188,7 +253,6 @@ def save_prediction_log(
             },
         )
 
-
 # ============================================================================
 # ROUTES
 # ============================================================================
@@ -197,10 +261,39 @@ def save_prediction_log(
 def health():
     return {
         "status": "ok",
+        "model_loaded": model is not None,
         "model_uri": MODEL_URI,
+        "effective_model_uri": get_effective_model_uri(),
+        "model_run_id": MODEL_RUN_ID,
+        "keras_model_artifact_path": KERAS_MODEL_ARTIFACT_PATH,
         "img_size": IMG_SIZE,
         "threshold": THRESHOLD,
     }
+
+
+@app.get("/debug/load-model")
+def debug_load_model():
+    try:
+        get_model()
+        return {
+            "status": "loaded",
+            "model_uri": MODEL_URI,
+            "effective_model_uri": get_effective_model_uri(),
+            "model_run_id": MODEL_RUN_ID,
+            "keras_model_artifact_path": KERAS_MODEL_ARTIFACT_PATH,
+        }
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "model_uri": MODEL_URI,
+                "effective_model_uri": get_effective_model_uri(),
+                "model_run_id": MODEL_RUN_ID,
+                "keras_model_artifact_path": KERAS_MODEL_ARTIFACT_PATH,
+                "error": str(exc),
+            },
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -209,7 +302,7 @@ def home(request: Request):
         "index.html",
         {
             "request": request,
-            "model_uri": MODEL_URI,
+            "model_uri": get_effective_model_uri(),
             "threshold": THRESHOLD,
         },
     )
@@ -218,6 +311,7 @@ def home(request: Request):
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     start_time = time.perf_counter()
+    effective_model_uri = get_effective_model_uri()
 
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
@@ -237,7 +331,8 @@ async def predict(file: UploadFile = File(...)):
     try:
         image_array = preprocess_image(file_bytes)
 
-        prob_dog = float(model.predict(image_array, verbose=0)[0][0])
+        loaded_model = get_model()
+        prob_dog = float(loaded_model.predict(image_array, verbose=0)[0][0])
         predicted_label = "dog" if prob_dog >= THRESHOLD else "cat"
         confidence = max(prob_dog, 1.0 - prob_dog)
 
@@ -257,7 +352,7 @@ async def predict(file: UploadFile = File(...)):
             prob_dog=prob_dog,
             confidence=confidence,
             threshold=THRESHOLD,
-            model_uri=MODEL_URI,
+            model_uri=effective_model_uri,
             latency_ms=latency_ms,
         )
 
@@ -268,7 +363,7 @@ async def predict(file: UploadFile = File(...)):
             "threshold": THRESHOLD,
             "image_uri": image_uri,
             "latency_ms": latency_ms,
-            "model_uri": MODEL_URI,
+            "model_uri": effective_model_uri,
         }
 
     except Exception as exc:
@@ -283,7 +378,7 @@ async def predict(file: UploadFile = File(...)):
                 prob_dog=0.0,
                 confidence=0.0,
                 threshold=THRESHOLD,
-                model_uri=MODEL_URI,
+                model_uri=effective_model_uri,
                 latency_ms=latency_ms,
                 error_message=str(exc),
             )
@@ -356,4 +451,11 @@ def recent_predictions(limit: int = 20):
     with engine.begin() as conn:
         rows = conn.execute(sql, {"limit": limit}).mappings().all()
 
-    return [dict(row) for row in rows]
+    result = []
+    for row in rows:
+        item = dict(row)
+        if item.get("created_at") is not None:
+            item["created_at"] = item["created_at"].isoformat()
+        result.append(item)
+
+    return result
