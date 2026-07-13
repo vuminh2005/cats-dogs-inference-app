@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
+pillow
+numpy
+pandas
+tensorflow
+mlflow==2.21.0
+boto3
+psycopg2-binary
+sqlalchemy
