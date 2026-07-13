@@ -298,10 +298,13 @@ def debug_load_model():
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
+    # FastAPI/Starlette versions on Render expect TemplateResponse arguments by name.
+    # Using positional args like TemplateResponse("index.html", {...}) can raise:
+    # TypeError: unhashable type: 'dict'
     return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
+        request=request,
+        name="index.html",
+        context={
             "model_uri": get_effective_model_uri(),
             "threshold": THRESHOLD,
         },
