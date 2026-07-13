@@ -2,29 +2,20 @@ import io
 import os
 import time
 import uuid
+import threading
+import zipfile
 from datetime import datetime
 from typing import Optional
 
-# Giảm bớt log TensorFlow và giới hạn thread để hợp hơn với Render CPU/RAM thấp.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-
 import boto3
 import mlflow
-import mlflow.tensorflow
 import numpy as np
-import tensorflow as tf
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from mlflow.tracking import MlflowClient
 from PIL import Image
 from sqlalchemy import create_engine, text
-
-try:
-    tf.config.threading.set_intra_op_parallelism_threads(1)
-    tf.config.threading.set_inter_op_parallelism_threads(1)
-except Exception:
-    pass
+from mlflow.tracking import MlflowClient
 
 # ============================================================================
 # CONFIG
@@ -32,16 +23,17 @@ except Exception:
 
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI")
 MODEL_URI = os.getenv("MODEL_URI", "models:/cats_dogs_classifier@champion")
-
-# Ưu tiên cách load trực tiếp file .keras artifact từ run.
-# Trên Render thêm:
-# MODEL_RUN_ID=0d81fbc6a8c9455188d422298766dea3
-# KERAS_MODEL_ARTIFACT_PATH=model/data/model.keras
 MODEL_RUN_ID = os.getenv("MODEL_RUN_ID")
 KERAS_MODEL_ARTIFACT_PATH = os.getenv(
     "KERAS_MODEL_ARTIFACT_PATH",
     "model/data/model.keras",
 )
+
+# Direct R2 download. Recommended for large model artifacts on Render free tier.
+# Example key:
+# artifacts/1/0d81fbc6a8c9455188d422298766dea3/artifacts/model/data/model.keras
+MODEL_R2_OBJECT_KEY = os.getenv("MODEL_R2_OBJECT_KEY")
+MODEL_LOCAL_PATH = os.getenv("MODEL_LOCAL_PATH", "/tmp/cats_dogs_model.keras")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -56,6 +48,7 @@ AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "auto")
 IMG_SIZE = tuple(int(x.strip()) for x in os.getenv("IMG_SIZE", "299,299").split(","))
 NUM_CHANNELS = int(os.getenv("NUM_CHANNELS", "3"))
 THRESHOLD = float(os.getenv("PREDICTION_THRESHOLD", "0.5"))
+UNCERTAIN_CONFIDENCE_THRESHOLD = float(os.getenv("UNCERTAIN_CONFIDENCE_THRESHOLD", "0"))
 
 MAX_FILE_SIZE_MB = float(os.getenv("MAX_FILE_SIZE_MB", "10"))
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/jpg"}
@@ -68,8 +61,11 @@ app = FastAPI(title="Cats vs Dogs Inference API")
 templates = Jinja2Templates(directory="app/templates")
 
 model = None
+model_load_lock = threading.Lock()
 engine = None
 s3_client = None
+last_model_file_debug = None
+
 
 # ============================================================================
 # STARTUP
@@ -77,30 +73,21 @@ s3_client = None
 
 @app.on_event("startup")
 def startup_event():
-    """Chỉ khởi tạo DB/R2/MLflow config.
-
-    Không load model ở startup, vì Render cần app mở port trước.
-    Model sẽ được lazy-load ở request /predict hoặc /debug/load-model.
-    """
     global engine, s3_client
 
-    missing_vars = []
-    for name, value in {
-        "MLFLOW_TRACKING_URI": MLFLOW_TRACKING_URI,
-        "DATABASE_URL": DATABASE_URL,
-        "R2_BUCKET_NAME": R2_BUCKET_NAME,
-        "MLFLOW_S3_ENDPOINT_URL": R2_ENDPOINT_URL,
-        "AWS_ACCESS_KEY_ID": AWS_ACCESS_KEY_ID,
-        "AWS_SECRET_ACCESS_KEY": AWS_SECRET_ACCESS_KEY,
-    }.items():
-        if not value:
-            missing_vars.append(name)
-
-    if missing_vars:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing_vars)}")
+    if not MLFLOW_TRACKING_URI:
+        raise RuntimeError("Missing MLFLOW_TRACKING_URI")
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL")
+    if not R2_BUCKET_NAME:
+        raise RuntimeError("Missing R2_BUCKET_NAME")
+    if not R2_ENDPOINT_URL:
+        raise RuntimeError("Missing MLFLOW_S3_ENDPOINT_URL")
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
+    # Important: do not load TensorFlow/model during startup.
+    # Render needs the app to bind the port first.
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
     s3_client = boto3.client(
@@ -111,39 +98,109 @@ def startup_event():
         region_name=AWS_DEFAULT_REGION,
     )
 
+
 # ============================================================================
 # UTILS
 # ============================================================================
 
 def get_effective_model_uri() -> str:
+    if MODEL_R2_OBJECT_KEY:
+        return f"s3://{R2_BUCKET_NAME}/{MODEL_R2_OBJECT_KEY}"
     if MODEL_RUN_ID:
         return f"runs:/{MODEL_RUN_ID}/{KERAS_MODEL_ARTIFACT_PATH}"
     return MODEL_URI
 
 
-def get_model():
-    """Lazy load model.
+def inspect_model_file(path: str) -> dict:
+    exists = os.path.exists(path)
+    size_bytes = os.path.getsize(path) if exists else 0
+    is_zip = zipfile.is_zipfile(path) if exists else False
+    first_bytes_hex = None
 
-    Ưu tiên tải thẳng file .keras artifact từ MLflow run bằng MODEL_RUN_ID.
-    Cách này tránh lỗi mlflow.tensorflow.load_model() không tìm thấy data/model.keras.
-    Nếu không set MODEL_RUN_ID, fallback về MODEL_URI.
-    """
-    global model
+    if exists:
+        with open(path, "rb") as f:
+            first_bytes_hex = f.read(16).hex()
+
+    return {
+        "path": path,
+        "exists": exists,
+        "size_bytes": size_bytes,
+        "size_mb": round(size_bytes / (1024 * 1024), 2),
+        "is_zipfile": is_zip,
+        "first_16_bytes_hex": first_bytes_hex,
+    }
+
+
+def download_model_from_r2() -> str:
+    if not MODEL_R2_OBJECT_KEY:
+        raise RuntimeError("MODEL_R2_OBJECT_KEY is not set")
+    if s3_client is None:
+        raise RuntimeError("S3 client is not initialized")
+
+    os.makedirs(os.path.dirname(MODEL_LOCAL_PATH) or "/tmp", exist_ok=True)
+
+    # Always re-download if local file is missing or too small.
+    # A valid model in this project is around hundreds of MB.
+    should_download = True
+    if os.path.exists(MODEL_LOCAL_PATH):
+        current_size = os.path.getsize(MODEL_LOCAL_PATH)
+        should_download = current_size < 1024 * 1024
+
+    if should_download:
+        s3_client.download_file(
+            Bucket=R2_BUCKET_NAME,
+            Key=MODEL_R2_OBJECT_KEY,
+            Filename=MODEL_LOCAL_PATH,
+        )
+
+    return MODEL_LOCAL_PATH
+
+
+def download_model_from_mlflow_artifacts() -> str:
+    if not MODEL_RUN_ID:
+        raise RuntimeError("MODEL_RUN_ID is not set")
+
+    client = MlflowClient()
+    return client.download_artifacts(
+        run_id=MODEL_RUN_ID,
+        path=KERAS_MODEL_ARTIFACT_PATH,
+    )
+
+
+def get_model():
+    global model, last_model_file_debug
 
     if model is not None:
         return model
 
-    if MODEL_RUN_ID:
-        client = MlflowClient()
-        local_model_path = client.download_artifacts(
-            run_id=MODEL_RUN_ID,
-            path=KERAS_MODEL_ARTIFACT_PATH,
-        )
-        model = tf.keras.models.load_model(local_model_path)
-        return model
+    with model_load_lock:
+        if model is not None:
+            return model
 
-    model = mlflow.tensorflow.load_model(MODEL_URI)
-    return model
+        # Lazy import TensorFlow only when model is really needed.
+        import tensorflow as tf
+
+        if MODEL_R2_OBJECT_KEY:
+            local_model_path = download_model_from_r2()
+        elif MODEL_RUN_ID:
+            local_model_path = download_model_from_mlflow_artifacts()
+        else:
+            # Fallback. Prefer not to use this on Render free tier for large models.
+            import mlflow.tensorflow
+            model = mlflow.tensorflow.load_model(MODEL_URI)
+            return model
+
+        last_model_file_debug = inspect_model_file(local_model_path)
+        if not last_model_file_debug["exists"]:
+            raise RuntimeError(f"Downloaded model file does not exist: {last_model_file_debug}")
+        if not last_model_file_debug["is_zipfile"]:
+            raise RuntimeError(
+                "Downloaded .keras file is not a valid zip file. "
+                f"Debug info: {last_model_file_debug}"
+            )
+
+        model = tf.keras.models.load_model(local_model_path, compile=False)
+        return model
 
 
 def preprocess_image(file_bytes: bytes) -> np.ndarray:
@@ -155,6 +212,9 @@ def preprocess_image(file_bytes: bytes) -> np.ndarray:
 
 
 def upload_image_to_r2(file_bytes: bytes, filename: str, content_type: str) -> str:
+    if s3_client is None:
+        raise RuntimeError("S3 client is not initialized")
+
     safe_ext = filename.split(".")[-1].lower() if "." in filename else "jpg"
     object_key = (
         f"{R2_UPLOAD_PREFIX}/"
@@ -172,17 +232,24 @@ def upload_image_to_r2(file_bytes: bytes, filename: str, content_type: str) -> s
     return f"s3://{R2_BUCKET_NAME}/{object_key}"
 
 
-def parse_model_name_version(model_uri: str) -> tuple[Optional[str], Optional[str]]:
+def parse_model_name_version(model_uri: str):
     model_name = None
     model_version = None
 
     if model_uri.startswith("models:/"):
-        parts = model_uri.replace("models:/", "").split("/")
-        model_name = parts[0] if len(parts) > 0 else None
-        model_version = parts[1] if len(parts) > 1 else None
-    elif model_uri.startswith("runs:/"):
+        raw = model_uri.replace("models:/", "")
+        if "@" in raw:
+            model_name, model_version = raw.split("@", 1)
+        else:
+            parts = raw.split("/")
+            model_name = parts[0] if len(parts) > 0 else None
+            model_version = parts[1] if len(parts) > 1 else None
+    elif MODEL_RUN_ID:
         model_name = "run_artifact"
         model_version = MODEL_RUN_ID
+    elif MODEL_R2_OBJECT_KEY:
+        model_name = "r2_artifact"
+        model_version = MODEL_R2_OBJECT_KEY
 
     return model_name, model_version
 
@@ -199,6 +266,9 @@ def save_prediction_log(
     latency_ms: float,
     error_message: Optional[str] = None,
 ):
+    if engine is None:
+        raise RuntimeError("Database engine is not initialized")
+
     sql = text(
         """
         INSERT INTO prediction_logs (
@@ -253,9 +323,15 @@ def save_prediction_log(
             },
         )
 
+
 # ============================================================================
 # ROUTES
 # ============================================================================
+
+@app.head("/")
+def head_home():
+    return Response(status_code=200)
+
 
 @app.get("/health")
 def health():
@@ -266,8 +342,12 @@ def health():
         "effective_model_uri": get_effective_model_uri(),
         "model_run_id": MODEL_RUN_ID,
         "keras_model_artifact_path": KERAS_MODEL_ARTIFACT_PATH,
+        "model_r2_object_key": MODEL_R2_OBJECT_KEY,
+        "model_local_path": MODEL_LOCAL_PATH,
+        "last_model_file_debug": last_model_file_debug,
         "img_size": IMG_SIZE,
         "threshold": THRESHOLD,
+        "uncertain_confidence_threshold": UNCERTAIN_CONFIDENCE_THRESHOLD,
     }
 
 
@@ -281,6 +361,8 @@ def debug_load_model():
             "effective_model_uri": get_effective_model_uri(),
             "model_run_id": MODEL_RUN_ID,
             "keras_model_artifact_path": KERAS_MODEL_ARTIFACT_PATH,
+            "model_r2_object_key": MODEL_R2_OBJECT_KEY,
+            "last_model_file_debug": last_model_file_debug,
         }
     except Exception as exc:
         return JSONResponse(
@@ -291,6 +373,8 @@ def debug_load_model():
                 "effective_model_uri": get_effective_model_uri(),
                 "model_run_id": MODEL_RUN_ID,
                 "keras_model_artifact_path": KERAS_MODEL_ARTIFACT_PATH,
+                "model_r2_object_key": MODEL_R2_OBJECT_KEY,
+                "last_model_file_debug": last_model_file_debug,
                 "error": str(exc),
             },
         )
@@ -298,13 +382,10 @@ def debug_load_model():
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    # FastAPI/Starlette versions on Render expect TemplateResponse arguments by name.
-    # Using positional args like TemplateResponse("index.html", {...}) can raise:
-    # TypeError: unhashable type: 'dict'
     return templates.TemplateResponse(
-        request=request,
         name="index.html",
         context={
+            "request": request,
             "model_uri": get_effective_model_uri(),
             "threshold": THRESHOLD,
         },
@@ -333,11 +414,15 @@ async def predict(file: UploadFile = File(...)):
 
     try:
         image_array = preprocess_image(file_bytes)
-
         loaded_model = get_model()
+
         prob_dog = float(loaded_model.predict(image_array, verbose=0)[0][0])
-        predicted_label = "dog" if prob_dog >= THRESHOLD else "cat"
         confidence = max(prob_dog, 1.0 - prob_dog)
+
+        if UNCERTAIN_CONFIDENCE_THRESHOLD > 0 and confidence < UNCERTAIN_CONFIDENCE_THRESHOLD:
+            predicted_label = "uncertain"
+        else:
+            predicted_label = "dog" if prob_dog >= THRESHOLD else "cat"
 
         image_uri = upload_image_to_r2(
             file_bytes=file_bytes,
@@ -364,6 +449,7 @@ async def predict(file: UploadFile = File(...)):
             "prob_dog": prob_dog,
             "confidence": confidence,
             "threshold": THRESHOLD,
+            "uncertain_confidence_threshold": UNCERTAIN_CONFIDENCE_THRESHOLD,
             "image_uri": image_uri,
             "latency_ms": latency_ms,
             "model_uri": effective_model_uri,
@@ -393,6 +479,9 @@ async def predict(file: UploadFile = File(...)):
 
 @app.get("/monitoring")
 def monitoring():
+    if engine is None:
+        raise HTTPException(status_code=500, detail="Database engine is not initialized")
+
     sql = text(
         """
         SELECT
@@ -402,6 +491,7 @@ def monitoring():
             SUM(CASE WHEN confidence < 0.6 THEN 1 ELSE 0 END) AS low_confidence_count,
             SUM(CASE WHEN predicted_label = 'cat' THEN 1 ELSE 0 END) AS cat_count,
             SUM(CASE WHEN predicted_label = 'dog' THEN 1 ELSE 0 END) AS dog_count,
+            SUM(CASE WHEN predicted_label = 'uncertain' THEN 1 ELSE 0 END) AS uncertain_count,
             SUM(CASE WHEN predicted_label = 'ERROR' THEN 1 ELSE 0 END) AS error_count
         FROM prediction_logs
         """
@@ -413,22 +503,28 @@ def monitoring():
     total = row["total_requests"] or 0
     cat_count = row["cat_count"] or 0
     dog_count = row["dog_count"] or 0
+    uncertain_count = row["uncertain_count"] or 0
 
     return {
-        "total_requests": total,
+        "total_requests": int(total),
         "avg_confidence": float(row["avg_confidence"] or 0),
         "avg_latency_ms": float(row["avg_latency_ms"] or 0),
         "low_confidence_count": int(row["low_confidence_count"] or 0),
         "cat_count": int(cat_count),
         "dog_count": int(dog_count),
+        "uncertain_count": int(uncertain_count),
         "error_count": int(row["error_count"] or 0),
         "cat_ratio": float(cat_count / total) if total else 0,
         "dog_ratio": float(dog_count / total) if total else 0,
+        "uncertain_ratio": float(uncertain_count / total) if total else 0,
     }
 
 
 @app.get("/recent-predictions")
 def recent_predictions(limit: int = 20):
+    if engine is None:
+        raise HTTPException(status_code=500, detail="Database engine is not initialized")
+
     limit = min(max(limit, 1), 100)
 
     sql = text(
@@ -454,11 +550,4 @@ def recent_predictions(limit: int = 20):
     with engine.begin() as conn:
         rows = conn.execute(sql, {"limit": limit}).mappings().all()
 
-    result = []
-    for row in rows:
-        item = dict(row)
-        if item.get("created_at") is not None:
-            item["created_at"] = item["created_at"].isoformat()
-        result.append(item)
-
-    return result
+    return [dict(row) for row in rows]
